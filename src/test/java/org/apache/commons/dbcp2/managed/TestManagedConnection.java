@@ -17,7 +17,9 @@
  */
 package org.apache.commons.dbcp2.managed;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.spy;
 
 import java.lang.reflect.Field;
 import java.sql.Connection;
@@ -51,163 +53,151 @@ import org.junit.jupiter.api.Test;
  */
 public class TestManagedConnection {
 
-    protected PoolingDataSource<PoolableConnection> ds = null;
+	public TransactionRegistry mockTransactionRegistry1(final TransactionManager transactionManager) {
+		TransactionRegistry mockInstance = spy(new TransactionRegistry(transactionManager));
+		try {
+			doAnswer((stubInvo) -> {
+				try {
+					return new TransactionContext(mockInstance,
+							new UncooperativeTransaction(transactionManager.getTransaction()));
+				} catch (final SystemException e) {
+					return null;
+				}
+			}).when(mockInstance).getActiveTransactionContext();
+		} catch (Throwable exception) {
+			exception.printStackTrace();
+		}
+		return mockInstance;
+	}
 
-    private GenericObjectPool<PoolableConnection> pool = null;
+	public LocalXAConnectionFactory mockLocalXAConnectionFactory1(final TransactionManager transactionManager,
+			final ConnectionFactory connectionFactory) {
+		LocalXAConnectionFactory mockInstance = spy(
+				new LocalXAConnectionFactory(transactionManager, connectionFactory));
+		try {
+			final Field field = LocalXAConnectionFactory.class.getDeclaredField("transactionRegistry");
+			field.setAccessible(true);
+			field.set(mockInstance, mockTransactionRegistry1(transactionManager));
+		} catch (final Exception e) {
+			e.printStackTrace();
+		}
+		return mockInstance;
+	}
 
-    protected TransactionManager transactionManager;
+	protected PoolingDataSource<PoolableConnection> ds = null;
 
-    @BeforeEach
-    public void setUp()
-        throws Exception {
-        // create a GeronimoTransactionManager for testing
-        transactionManager = new TransactionManagerImpl();
+	private GenericObjectPool<PoolableConnection> pool = null;
 
-        // create a driver connection factory
-        final Properties properties = new Properties();
-        properties.setProperty("user", "userName");
-        properties.setProperty("password", "password");
-        final ConnectionFactory connectionFactory = new DriverConnectionFactory(new TesterDriver(), "jdbc:apache:commons:testdriver", properties);
+	protected TransactionManager transactionManager;
 
-        // wrap it with a LocalXAConnectionFactory
-        final XAConnectionFactory xaConnectionFactory = new UncooperativeLocalXAConnectionFactory(transactionManager, connectionFactory);
+	@BeforeEach
+	public void setUp() throws Exception {
+		// create a GeronimoTransactionManager for testing
+		transactionManager = new TransactionManagerImpl();
 
-        // create the pool object factory
-        final PoolableConnectionFactory factory = new PoolableConnectionFactory(xaConnectionFactory, null);
-        factory.setValidationQuery("SELECT DUMMY FROM DUAL");
-        factory.setDefaultReadOnly(Boolean.TRUE);
-        factory.setDefaultAutoCommit(Boolean.TRUE);
+		// create a driver connection factory
+		final Properties properties = new Properties();
+		properties.setProperty("user", "userName");
+		properties.setProperty("password", "password");
+		final ConnectionFactory connectionFactory = new DriverConnectionFactory(new TesterDriver(),
+				"jdbc:apache:commons:testdriver", properties);
 
-        // create the pool
-        pool = new GenericObjectPool<>(factory);
-        factory.setPool(pool);
-        pool.setMaxTotal(10);
-        pool.setMaxWaitMillis(100);
+		// wrap it with a LocalXAConnectionFactory
+		final LocalXAConnectionFactory xaConnectionFactory = mockLocalXAConnectionFactory1(transactionManager,
+				connectionFactory);
 
-        // finally create the datasource
-        ds = new ManagedDataSource<>(pool, xaConnectionFactory.getTransactionRegistry());
-        ds.setAccessToUnderlyingConnectionAllowed(true);
-    }
+		// create the pool object factory
+		final PoolableConnectionFactory factory = new PoolableConnectionFactory(xaConnectionFactory, null);
+		factory.setValidationQuery("SELECT DUMMY FROM DUAL");
+		factory.setDefaultReadOnly(Boolean.TRUE);
+		factory.setDefaultAutoCommit(Boolean.TRUE);
 
-    @AfterEach
-    public void tearDown()
-        throws Exception {
-        pool.close();
-    }
+		// create the pool
+		pool = new GenericObjectPool<>(factory);
+		factory.setPool(pool);
+		pool.setMaxTotal(10);
+		pool.setMaxWaitMillis(100);
 
-    public Connection getConnection()
-        throws Exception {
-        return ds.getConnection();
-    }
+		// finally create the datasource
+		ds = new ManagedDataSource<>(pool, xaConnectionFactory.getTransactionRegistry());
+		ds.setAccessToUnderlyingConnectionAllowed(true);
+	}
 
-    @Test
-    public void testConnectionReturnOnErrorWhenEnlistingXAResource()
-        throws Exception {
-        // see DBCP-433
+	@AfterEach
+	public void tearDown() throws Exception {
+		pool.close();
+	}
 
-        transactionManager.begin();
-        try {
-            final DelegatingConnection<?> connectionA = (DelegatingConnection<?>) getConnection();
-            connectionA.close();
-        } catch (final SQLException e) {
-            // expected
-        }
-        transactionManager.commit();
-        assertEquals(1, pool.getBorrowedCount());
-        // assertEquals(1, pool.getReturnedCount());
-        assertEquals(1, pool.getDestroyedCount());
-        assertEquals(0, pool.getNumActive());
-    }
+	public Connection getConnection() throws Exception {
+		return ds.getConnection();
+	}
 
-    private class UncooperativeLocalXAConnectionFactory
-        extends LocalXAConnectionFactory {
+	@Test
+	public void testConnectionReturnOnErrorWhenEnlistingXAResource() throws Exception {
+		// see DBCP-433
 
-        public UncooperativeLocalXAConnectionFactory(final TransactionManager transactionManager, final ConnectionFactory connectionFactory) {
-            super(transactionManager, connectionFactory);
+		transactionManager.begin();
+		try {
+			final DelegatingConnection<?> connectionA = (DelegatingConnection<?>) getConnection();
+			connectionA.close();
+		} catch (final SQLException e) {
+			// expected
+		}
+		transactionManager.commit();
+		assertEquals(1, pool.getBorrowedCount());
+		// assertEquals(1, pool.getReturnedCount());
+		assertEquals(1, pool.getDestroyedCount());
+		assertEquals(0, pool.getNumActive());
+	}
 
-            try {
-                // inject our own TransactionRegistry which returns Uncooperative Transactions which always fail to enlist a XAResource
-                final Field field = LocalXAConnectionFactory.class.getDeclaredField("transactionRegistry");
-                field.setAccessible(true);
-                field.set(this, new UncooperativeTransactionRegistry(transactionManager));
-            } catch (final Exception e) {
-                e.printStackTrace();
-            }
-        }
-    }
+	/**
+	 * Transaction that always fails enlistResource.
+	 */
+	private class UncooperativeTransaction implements Transaction {
 
-    private class UncooperativeTransactionRegistry
-        extends TransactionRegistry {
+		private final Transaction wrappedTransaction;
 
-        public UncooperativeTransactionRegistry(final TransactionManager transactionManager) {
-            super(transactionManager);
-        }
+		public UncooperativeTransaction(final Transaction transaction) {
+			this.wrappedTransaction = transaction;
+		}
 
-        @Override
-        public TransactionContext getActiveTransactionContext()
-            throws SQLException {
-            try {
-                return new TransactionContext(this, new UncooperativeTransaction(transactionManager.getTransaction()));
-            } catch (final SystemException e) {
-                return null;
-            }
-        }
+		@Override
+		public void commit() throws HeuristicMixedException, HeuristicRollbackException, RollbackException,
+				SecurityException, SystemException {
+			wrappedTransaction.commit();
+		}
 
-    }
+		@Override
+		public boolean delistResource(final XAResource arg0, final int arg1)
+				throws IllegalStateException, SystemException {
+			return wrappedTransaction.delistResource(arg0, arg1);
+		}
 
-    /**
-     * Transaction that always fails enlistResource.
-     */
-    private class UncooperativeTransaction
-        implements Transaction {
+		@Override
+		public int getStatus() throws SystemException {
+			return wrappedTransaction.getStatus();
+		}
 
-        private final Transaction wrappedTransaction;
+		@Override
+		public void registerSynchronization(final Synchronization arg0)
+				throws IllegalStateException, RollbackException, SystemException {
+			wrappedTransaction.registerSynchronization(arg0);
+		}
 
-        public UncooperativeTransaction(final Transaction transaction) {
-            this.wrappedTransaction = transaction;
-        }
+		@Override
+		public void rollback() throws IllegalStateException, SystemException {
+			wrappedTransaction.rollback();
+		}
 
-        @Override
-        public void commit()
-            throws HeuristicMixedException, HeuristicRollbackException, RollbackException, SecurityException,
-            SystemException {
-            wrappedTransaction.commit();
-        }
+		@Override
+		public void setRollbackOnly() throws IllegalStateException, SystemException {
+			wrappedTransaction.setRollbackOnly();
+		}
 
-        @Override
-        public boolean delistResource(final XAResource arg0, final int arg1)
-            throws IllegalStateException, SystemException {
-            return wrappedTransaction.delistResource(arg0, arg1);
-        }
-
-        @Override
-        public int getStatus()
-            throws SystemException {
-            return wrappedTransaction.getStatus();
-        }
-
-        @Override
-        public void registerSynchronization(final Synchronization arg0)
-            throws IllegalStateException, RollbackException, SystemException {
-            wrappedTransaction.registerSynchronization(arg0);
-        }
-
-        @Override
-        public void rollback()
-            throws IllegalStateException, SystemException {
-            wrappedTransaction.rollback();
-        }
-
-        @Override
-        public void setRollbackOnly()
-            throws IllegalStateException, SystemException {
-            wrappedTransaction.setRollbackOnly();
-        }
-
-        @Override
-        public synchronized boolean enlistResource(final XAResource xaRes) {
-            return false;
-        }
-    }
+		@Override
+		public synchronized boolean enlistResource(final XAResource xaRes) {
+			return false;
+		}
+	}
 
 }
